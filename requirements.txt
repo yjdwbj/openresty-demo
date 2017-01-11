@@ -1,0 +1,5 @@
+uuid-dev
+libuuid1
+libcrypto++-utils
+nettle-dev
+libnettle4
