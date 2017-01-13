@@ -109,7 +109,7 @@ local function RedisDB()
     end
     ok,err = red:select(1)
     if not ok then
-        ok , err = red:auth("f4e4821080ca489d3361a520fc2123495755559b45fb24323c5b02e79163e425")
+        ok , err = red:auth(config.redis.auth)
         if not ok then
             return nil,err
         end
@@ -120,18 +120,6 @@ local function RedisDB()
 end
 
 
-local function list_todict(lst)
-    local result = {}
-    local nextkey
-    for k,v in ipairs(lst) do
-        if k % 2 == 1 then
-            nextkey = v
-        else
-            result[nextkey] = v
-        end
-    end
-    return result
-end
 
 
 
@@ -161,8 +149,27 @@ local FormatError = {err="FormatError", msg="格式错误", ok=false}
 local DevActError = {err="DevActError", msg="设备未出厂", ok=false}
 
 
+local function list_todict(lst)
+    local result = {}
+    local nextkey
+    if type(lst) ~= "table" then
+        return nil
+    end
+    for k,v in ipairs(lst) do
+        if k % 2 == 1 then
+            nextkey = v
+        else
+            result[nextkey] = v
+        end
+    end
+    return result
+end
 
 local function debug_table(t)
+    if not t then
+        ngx.say("tables is nil")
+        return nil
+    end
     ngx.say("debug  print " .. tostring(t) .. " len " .. #t)
     for k,v in pairs(t) do
         if type(v) == "string" then
@@ -183,33 +190,8 @@ local function check_cookie(req,res)
     return true
 end
 
-local function redis_cmd(cmd,args)
-    local red = redis:new()
-    local ok,err = red:connect(config.redis.host,config.redis.port)
-    red:select(1)
-    if not ok then
-        ok , err = red:auth(config.redis.auth)
-        -- return ok,err
-    end
-    if not err then
-        red:init_pipeline()
-        red:hset(signid,"password",hex(sha256:digest()))
-        red:hset(signid,"uuid",uuid)
-        red:expire(signid,config.settings.SESSION_COOKIE_AGE)
-        ok,err = red:commit_pipeline()
-        if err then
-            ngx.log(ngx.ERR,"redis commit  pipeline error",err)
-        end
-    end
-    local ok,err = red:set_keepalive(10000,100)
-    if not ok then
-        ngx.log(ngx.ERR,"set keepalive error")
-    end
-end
 
 -- 这里是为了兼django插入的加密认证方式, key = "<algorithm>$<iterations>$<salt>$<hash>"
-
-
 local function check_password(oldpwd,newpwd)
     local algorithm,iterations,salt,hash = string.match(oldpwd,"(%w+_%w+)%$(%d+)%$(%w+)%$([A-Za-z0-9+/=]+)")
     if not algorithm or not iterations or not salt  or not hash then
@@ -237,11 +219,7 @@ local function response_login(uuid,key,tokenlist,sessionid)
     srvres ,err = user_model:query_by_mqtt_srv()
     local servers = nil
     if  not err then
-        if #srvres == 2 then
-            servers = srvres[1] .. ":" .. srvres[2]
-        else
-            servers = srvres.ipaddr  .. ":" .. srvres.port
-        end
+        servers = srvres.ipaddr  .. ":" .. srvres.port
     end
 
 
@@ -268,12 +246,6 @@ local function response_login(uuid,key,tokenlist,sessionid)
  dictable["res"] = cjson.encode(retable)
  dictable[G_ACCOUNT] = cjson.encode(tokenlist)
  ok,err = red:hmset(sessionid,dictable)
- -- ok,err = red:hmset(sessionid,{
- --    G_PASSWORD = hex(sha256:digest()),
- --    G_UUID = uuid, G_IPADDR = ngx.var.remote_addr,
- --    res = cjson.encode(retable),
- --    G_ACCOUNT=cjson.encode(tokenlist)
- --    })
  if err then
     ngx.say("hmset failed")
 end
@@ -286,7 +258,7 @@ ok,err = red:set_keepalive(10000,100)
 return retable
 end
 
-iot_router:get("/dev/auth/:usertoken/:userpass/",function(req,res,next)
+iot_router:post("/dev/auth/:usertoken/:userpass/",function(req,res,next)
 
     -- 检查有没有登录记录
     local usertoken = req.params.usertoken
@@ -305,7 +277,6 @@ iot_router:get("/dev/auth/:usertoken/:userpass/",function(req,res,next)
             local dict = list_todict(auth_cache)
             if dict[G_IPADDR] == ngx.var.remote_addr and
                 dict[G_UUID] == usertoken then
-                ngx.say(" get auth from redis ")
                 red:expire(config.settings.SESSION_COOKIE_AGE)
                 local restable = cjson.decode(dict.res)
                 restable.time = ngx.time()
@@ -322,18 +293,13 @@ iot_router:get("/dev/auth/:usertoken/:userpass/",function(req,res,next)
         return res:status(403):json(PwdError)
     end
     local uuid ,key
-    if #result == 2 then
-        uuid = result[1]
-        key = result[2]
-    else
-        uuid = result.uuid
-        key = result.key
-    end
+    uuid = result.uuid
+    key = result.key
 
     ngx.log(ngx.ERR," uuid " .. uuid .. " key " .. key)
     if uuid and key then
         if check_password(key,tostring(userpass)) then
-            user_model:insert_dev_login(uuid)
+            user_model:insert_dev_login(uuid,ngx.var.remote_addr)
             return res:json(response_login(uuid,key,nil))
         end
     end
@@ -342,28 +308,30 @@ iot_router:get("/dev/auth/:usertoken/:userpass/",function(req,res,next)
     end)
 
 
-iot_router:get("/app/auth/:usertoken/:userpass/",function(req,res,next)
+iot_router:post("/app/auth/:usertoken/:userpass/",function(req,res,next)
     local usertoken = req.params.usertoken
     local userpass =  req.params.userpass
 
     if ngx.var.http_cookie then
-        local _,sessionid = string.match(ngx.var.http_cookie,"(%w+)=(%w+)")
+        local _,sessionid = string.match(ngx.var.http_cookie,"(sessionid)=(%w+)")
         local red,err = RedisDB()
         if err then
             ngx.say(" redis server error ",err)
         end
 
         local auth_cache,err = red:hgetall(sessionid)
-        if not err then
+        debug_table(auth_cache)
+        if not err and auth_cache then
             local dict = list_todict(auth_cache)
-            -- ngx.say(" auth from cache ",string.find(dict[G_ACCOUNT],usertoken))
-            if dict[G_IPADDR] == ngx.var.remote_addr and
-                string.find(dict[G_ACCOUNT],usertoken) then
-                ngx.say("auth from cache ")
-                red:expire(sessionid,config.settings.SESSION_COOKIE_AGE)
-                local restable = cjson.decode(dict.res)
-                restable.time = ngx.time()
-                return res:json(restable)
+            if dict then
+                -- ngx.say(" auth from cache ",string.find(dict[G_ACCOUNT],usertoken))
+                if dict[G_IPADDR] == ngx.var.remote_addr and
+                    string.find(dict[G_ACCOUNT],usertoken) then
+                    red:expire(sessionid,config.settings.SESSION_COOKIE_AGE)
+                    local restable = cjson.decode(dict.res)
+                    restable.time = ngx.time()
+                    return res:json(restable)
+                end
             end
         end
     end
@@ -380,20 +348,11 @@ iot_router:get("/app/auth/:usertoken/:userpass/",function(req,res,next)
     end
 
     local uuid,key,phone_active,phone,email
-
-    if #result == 5 then
-        uuid = result[1]
-        key = result[2]
-        phone_active = result[3]
-        phone = result[4]
-        email = result[5]
-    else
-        uuid = result.uuid
-        key = result.key
-        phone_active  = result.phone_active
-        phone = result.phone
-        email = result.email
-    end
+    uuid = result.uuid
+    key = result.key
+    phone_active  = result.phone_active
+    phone = result.phone
+    email = result.email
 
     if not phone_active then
         return res:json(PhoneInactive)
@@ -406,7 +365,7 @@ iot_router:get("/app/auth/:usertoken/:userpass/",function(req,res,next)
             local tokenlist = {uuid,usertoken,phone,email}
             retable = response_login(uuid,key,tokenlist,sessionid)
             retable.time = ngx.time()
-            user_model:insert_app_login(retable.uuid)
+            user_model:insert_app_login(retable.uuid,ngx.var.remote_addr)
             return res:json(retable)
         else
             return res:status(403):json(PwdError)
@@ -417,12 +376,30 @@ end)
 
 
 
-local function AppBindDev(request,token,target)
+local function AppBindDev(req,res,token)
+    debug_table(req)
     local post_args = ngx.req.get_post_args()
-    ngx.say(" post args is " .. type(post_args) .. " len " .. #post_args)
-    for k,v in pairs(post_args) do
-        ngx.say( " kkk is "  .. k .. " val " .. type(v))
+    debug_table(post_args)
+    local dev = req.parms.target
+    
+    local result,err =  user_model:query_dev_test(dev)
+    if result then
+        res:json(BindError)
     end
+    result,err = user_model:query_makerdb(dev)
+    if not result then
+        res:json(TargetNotExists)
+    end
+
+    if result.status < 3 then
+        res:json(DevActError)
+    end
+    user_model:insert_new_devices(result,ngx.var.remote_addr)
+    if not check_password(result.key,post_args.dkey) then
+        return res:json(PwdError)
+    end 
+    return res:json({ok = G_OK})
+
 
 end
 
@@ -432,15 +409,21 @@ end
 local function  AppDropDev()
 end
 
-local optFunc = {bind = AppBindDev,
-checkbind = AppCheckBindDev,
-unbind = AppDropDev,
-reqshare = AcceptBindLink,
-sharedev = AppShareDev }
+local optFunc = {}
+optFunc["bind"] = AppBindDev()
+optFunc["checkbind"] = AppBindDev
+optFunc["unbind"] = AppBindDev
+optFunc["reqshare"] = AppBindDev
+optFunc["sharedev"] = AppBindDev
+
+-- local optFunc = {bind = AppBindDev,
+-- checkbind = AppCheckBindDev,
+-- unbind = AppDropDev,
+-- reqshare = AcceptBindLink,
+-- sharedev = AppShareDev }
 
 iot_router:post("/app/opt/:target/:action/",function(req,res,next)
     if not ngx.var.http_cookie then
-        ngx.say(" not cookie ")
         return res:status(403):json(UnAuth)
     end
 
@@ -452,7 +435,7 @@ iot_router:post("/app/opt/:target/:action/",function(req,res,next)
 
     local auth_cache,err = red:hgetall(sessionid)
     if err then
-        -- ngx.say(" error ",err)
+        ngx.say(" error ",err," sessionid ",sessionid)
         return res:status(403):json(UnAuth)
     end
 
@@ -461,19 +444,20 @@ iot_router:post("/app/opt/:target/:action/",function(req,res,next)
         return res:status(403):json(UnAuth)
     end
 
-    local target = req.params.target
-    local action = req.params.action
+    local token = dict.uuid
 
     _,err = red:expire(sessionid,config.settings.SESSION_COOKIE_AGE)
 
-    if optFunc[action] == nil then
-        ngx.say("action is nil ")
+    if optFunc[req.params.action] == nil then
         return res:status(403):json(UnkownAction)
     end
-    return optFunc[action](req,token,target)
+    debug_table(user_model)
+    debug_table(optFunc)
+    ngx.say("this type is ",type(optFunc[action]))
+    return optFunc[action](req,res,token)
     end)
 
-iot_router:get("/app/getinfo/",function(req,res,next)
+iot_router:post("/app/getinfo/",function(req,res,next)
     if not ngx.var.http_cookie then
         return res:status(403):json(UnAuth)
     end

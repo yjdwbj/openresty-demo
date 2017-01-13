@@ -74,6 +74,14 @@ return {
     --     	pool_size = 50 -- connection pool size
 	-- 	}
 	-- },
+    r_devdb = {
+            host = "192.168.25.105",
+            port = "5432",
+            database = "jieli_iot_idmaker",
+            user = "postgres",
+            password = ""
+    },
+
     r_pgsql = {
             host = "192.168.25.100",
             port = "5433",

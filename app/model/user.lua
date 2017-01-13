@@ -6,6 +6,17 @@ local wdb = WDB:new()
 local user_model = {}
 
 
+local function debug_table(t)
+    ngx.say("debug  print " .. tostring(t) .. " len " .. #t)
+    for k,v in pairs(t) do
+        if type(v) == "string" then
+            ngx.say(" key: ",k," value: ",v)
+        else
+            ngx.say(" key: ",k, " value: ",type(v))
+        end
+    end
+end
+
 function user_model:new(username, password, avatar)
     return db:query("insert into user(username, password, avatar) values(?,?,?)",
             {username, password, avatar})
@@ -30,6 +41,26 @@ function user_model:query_by_id(id)
     end
 end
 
+
+
+local function list_todict(lst)
+    local result = {}
+    local nextkey
+    if type(lst) ~= "table" then
+        return nil
+    end
+    for k,v in ipairs(lst) do
+        if k % 2 == 1 then
+            nextkey = v
+        else
+            result[nextkey] = v
+        end
+    end
+    return result
+end
+
+setmetatable(user_model,{list_todict,list_todict()})
+
 local function checkuuid(uuid)
     local x = "%x"
     local t = {x:rep(8),x:rep(4),x:rep(4),x:rep(4),x:rep(12)}
@@ -48,12 +79,7 @@ end
 function user_model:query_by_iot_app_login(uuid)
 
     local res,err
-    -- if checkuuid(uuid) then
-    local x = "%x"
-    local t = {x:rep(8),x:rep(4),x:rep(4),x:rep(4),x:rep(12)}
-    local t2 = x:rep(32)
-    local pattern = table.concat(t,'%-')
-    if string.match(uuid,pattern) or string.match(uuid,t2) then
+    if checkuuid(uuid) then
         res,err = rdb:query("select uuid,key,phone_active,phone,email from user_manager_appuser where uname=? or uuid=?",{uuid,uuid})
     else
         res,err = rdb:query("select uuid,key,phone_active,phone,email from user_manager_appuser where uname=? or email=? or  phone=?", {uuid,uuid,uuid})
@@ -61,17 +87,13 @@ function user_model:query_by_iot_app_login(uuid)
     if not res or err or type(res) ~= "table" then
         return nil,err or "error"
     end
+    debug_table(res[1])
     return res[1],err
 end
 
 function user_model:query_by_iot_dev_login(uuid)
     local res,err
-    -- if checkuuid(uuid) then
-    local x = "%x"
-    local t = {x:rep(8),x:rep(4),x:rep(4),x:rep(4),x:rep(12)}
-    local t2 = x:rep(32)
-    local pattern = table.concat(t,'%-')
-    if string.match(uuid,pattern) or string.match(uuid,t2) then
+    if checkuuid(uuid) then
         res,err = rdb:query("select uuid,key from user_manager_devices where  uuid=?",{uuid})
     else
         return nil
@@ -81,7 +103,7 @@ function user_model:query_by_iot_dev_login(uuid)
         return nil,err
     end
 
-    return res[1]
+    return list_todict(res[1]),err
 end
 
 function user_model:query_by_mqtt_srv()
@@ -92,30 +114,65 @@ function user_model:query_by_mqtt_srv()
     return res[1],err
 end
 
-
-function user_model:insert_app_login(uuid)
-    -- local timestamp = string.format("%d",os.time())
-    return  wdb:query("insert into user_manager_appuserloginhistory(inout,optime,ipaddr_id,user_id) values('true','now',1,?)",
-                    {uuid})
-
-end
-
-function user_model:insert_dev_login(uuid)
-    -- local timestamp = string.format("%d",os.time())
-    return  wdb:query("insert into user_manager_devicesloginhistory(inout,optime,ipaddr_id,user_id) values('true','now',1,?)",
-                    {uuid})
-
-end
-
-function user_model:get_or_create(ipaddr)
+local function get_or_create(ipaddr)
     local res,err = rdb:query("select id from iplist where ipaddr=?;",{ipaddr})
     if not res or type(res) ~= "table" then
         res,err = wdb:query("insert into iplist (ipaddr) values(?);",{ipaddr})
         res,err = rdb:query("select id from iplist where ipaddr=?;",{ipaddr})
+        debug_table(res)
     end
-        
     return res[1],err
 end
+
+function user_model:insert_app_login(uuid,addr)
+    -- local timestamp = string.format("%d",os.time())
+    return  wdb:query("insert into user_manager_appuserloginhistory(inout,optime,ipaddr_id,user_id) values('true','now',1,?)",
+                      {get_or_create(addr),uuid})
+
+end
+
+function user_model:insert_dev_login(uuid,addr)
+    -- local timestamp = string.format("%d",os.time())
+    return  wdb:query("insert into user_manager_devicesloginhistory(inout,optime,ipaddr_id,user_id) values('true','now',?,?)",
+                      {get_or_create(addr),uuid})
+end
+
+function user_model:query_bindlist_test(uuid)
+   	local res, err =  rdb:query("select 1 from bindlist where uuid=?", {uuid})
+   	if not res or err or type(res) ~= "table" or #res ~=1 then
+		return nil, err or "error"
+	end
+    debug_table(res[1])
+	return res[1], err
+end
+
+function user_model:query_dev_test(uuid)
+   	local res, err =  rdb:query("select 1 from user_manager_devices where uuid=?", {uuid})
+   	if not res or err or type(res) ~= "table" or #res ~=1 then
+		return nil, err or "error"
+	end
+    debug_table(res[1])
+	return res[1], err
+end
+
+
+function user_model:insert_new_devices(dev)
+    local res,err = wdb:query("insert into user_manager_devices \
+        (mac,uuid,appkey,key,name,regip,regtime)  values(?,?,?,?,?,'now');",
+        {dev.iot_mac,dev.uuid,dev.appkey,dev.key,dev.name,get_or_create(ipaddr)})
+    return res,err
+end
+
+function user_model:query_makerdb(uuid)
+   	local res, err =  rdb:query("select * from user_manager_devices where uuid=?", {uuid})
+   	if not res or err or type(res) ~= "table" or #res ~=1 then
+		return nil, err or "error"
+	end
+    debug_table(res[1])
+	return res[1], err
+
+end
+
     
 
 
@@ -125,7 +182,6 @@ function user_model:query_by_username(username)
    	if not res or err or type(res) ~= "table" or #res ~=1 then
 		return nil, err or "error"
 	end
-
 	return res[1], err
 end
 
